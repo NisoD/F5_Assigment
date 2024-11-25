@@ -258,7 +258,10 @@ func AccountsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func createAccount(w http.ResponseWriter, r *http.Request) {
-    var input struct {
+    // check for Admin
+
+
+	var input struct {
         UserID  int     `json:"user_id"`
         Balance float64 `json:"balance"`
     }
