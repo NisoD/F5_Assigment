@@ -316,8 +316,6 @@ func listAccounts(w http.ResponseWriter, r *http.Request) {
 
     json.NewEncoder(w).Encode(accountsList)
 }
-
-// BalanceHandler handles balance-related operations
 func BalanceHandler(w http.ResponseWriter, r *http.Request) {
     claims, ok := r.Context().Value("claims").(*Claims)
     if !ok {
@@ -325,9 +323,31 @@ func BalanceHandler(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+    userIDStr := r.URL.Query().Get("user_id")
+    userID, err := strconv.Atoi(userIDStr)
+    if err != nil {
+        http.Error(w, "Invalid user_id", http.StatusBadRequest)
+        return
+    }
+
+    mu.RLock()
+    currentUser, exists := users[claims.Username]
+    mu.RUnlock()
+
+    if !exists {
+        http.Error(w, "User not found", http.StatusForbidden)
+        return
+    }
+
+    // Only allow if admin or accessing own account
+    if claims.Role != RoleAdmin && currentUser.ID != userID {
+        http.Error(w, "Unauthorized access", http.StatusForbidden)
+        return
+    }
+
     switch r.Method {
     case http.MethodGet:
-        getBalance(w, r, claims)
+        getBalance(w, r, userID)
     case http.MethodPost:
         depositBalance(w, r, claims)
     case http.MethodDelete:
@@ -335,57 +355,6 @@ func BalanceHandler(w http.ResponseWriter, r *http.Request) {
     default:
         http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
     }
-}
-
-func checkBalanceAccess(claims *Claims, targetUserID int) bool {
-    if claims.Role == RoleAdmin {
-        return true
-    }
-
-    mu.RLock()
-    user, exists := users[claims.Username]
-    mu.RUnlock()
-
-    return exists && user.ID == targetUserID
-}
-
-func getBalance(w http.ResponseWriter, r *http.Request, claims *Claims) {
-    userIDStr := r.URL.Query().Get("user_id")
-    if userIDStr == "" {
-        http.Error(w, "Missing user_id parameter", http.StatusBadRequest)
-        return
-    }
-
-    userID, err := strconv.Atoi(userIDStr)
-    if err != nil {
-        http.Error(w, "Invalid user_id", http.StatusBadRequest)
-        return
-    }
-
-    if !checkBalanceAccess(claims, userID) {
-        http.Error(w, "Forbidden", http.StatusForbidden)
-        return
-    }
-
-    mu.RLock()
-    var userAccount *Account
-    for _, acc := range accounts {
-        if acc.UserID == userID {
-            accCopy := acc
-            userAccount = &accCopy
-            break
-        }
-    }
-    mu.RUnlock()
-
-    if userAccount == nil {
-        http.Error(w, ErrAccountNotFound.Error(), http.StatusNotFound)
-        return
-    }
-
-    json.NewEncoder(w).Encode(map[string]float64{
-        "balance": userAccount.Balance,
-    })
 }
 
 func depositBalance(w http.ResponseWriter, r *http.Request, claims *Claims) {
@@ -398,6 +367,7 @@ func depositBalance(w http.ResponseWriter, r *http.Request, claims *Claims) {
         http.Error(w, "Invalid request body", http.StatusBadRequest)
         return
     }
+    
 
     // Validate input
     if input.Amount <= 0 {
@@ -449,6 +419,42 @@ func depositBalance(w http.ResponseWriter, r *http.Request, claims *Claims) {
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(account)
 }
+
+func getBalance(w http.ResponseWriter, r *http.Request, userID int) {
+    mu.RLock()
+    var userAccount *Account
+    for _, acc := range accounts {
+        if acc.UserID == userID {
+            accCopy := acc
+            userAccount = &accCopy
+            break
+        }
+    }
+    mu.RUnlock()
+
+    if userAccount == nil {
+        http.Error(w, ErrAccountNotFound.Error(), http.StatusNotFound)
+        return
+    }
+
+    json.NewEncoder(w).Encode(map[string]float64{
+        "balance": userAccount.Balance,
+    })
+}
+
+func checkBalanceAccess(claims *Claims, targetUserID int) bool {
+    if claims.Role == RoleAdmin {
+        return true
+    }
+
+    mu.RLock()
+    user, exists := users[claims.Username]
+    mu.RUnlock()
+
+    return exists && user.ID == targetUserID
+}
+
+
 
 func withdrawBalance(w http.ResponseWriter, r *http.Request, claims *Claims) {
     var input struct {
@@ -507,57 +513,72 @@ func withdrawBalance(w http.ResponseWriter, r *http.Request, claims *Claims) {
 }
 
 // Auth middleware for JWT verification
-// Modify the Auth function to return an alice.Constructor
+// Auth handles user authentication and access control
 func Auth(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        // Get token from header
-        authHeader := r.Header.Get("Authorization")
-        if authHeader == "" {
-            http.Error(w, "Missing authorization header", http.StatusUnauthorized)
-            return
-        }
-
-        // Check Bearer scheme
-        tokenParts := strings.Split(authHeader, " ")
-        if len(tokenParts) != 2 || tokenParts[0] != "Bearer" {
-            http.Error(w, "Invalid authorization header format", http.StatusUnauthorized)
-            return
-        }
-
-        tokenStr := tokenParts[1]
-
-        // Parse and validate token
-        claims := &Claims{}
-        token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
-            // Validate signing method
-            if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-                return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-            }
-            return jwtKey, nil
-        })
-
+        // Validate authorization header
+        token, err := extractAndValidateToken(r)
         if err != nil {
-            if err == jwt.ErrSignatureInvalid {
-                http.Error(w, "Invalid token signature", http.StatusUnauthorized)
-                return
-            }
-            http.Error(w, "Invalid token", http.StatusUnauthorized)
+            http.Error(w, err.Error(), http.StatusUnauthorized)
             return
         }
 
-        if !token.Valid {
-            http.Error(w, "Invalid token", http.StatusUnauthorized)
-            return
-        }
-
-        // Check token expiration
-        if time.Now().Unix() > claims.ExpiresAt {
-            http.Error(w, "Token expired", http.StatusUnauthorized)
-            return
-        }
-
-        // Add claims to context
-        ctx := context.WithValue(r.Context(), "claims", claims)
+        // Add claims to context and continue
+        ctx := context.WithValue(r.Context(), "claims", token.Claims.(*Claims))
         next.ServeHTTP(w, r.WithContext(ctx))
     })
+}
+
+// extractAndValidateToken validates the JWT token from the request
+func extractAndValidateToken(r *http.Request) (*jwt.Token, error) {
+    // Extract token from Authorization header
+    tokenStr, err := extractTokenFromHeader(r)
+    if err != nil {
+        return nil, err
+    }
+
+    // Parse and validate token
+    return parseToken(tokenStr)
+}
+
+// extractTokenFromHeader retrieves the JWT token from the Authorization header
+func extractTokenFromHeader(r *http.Request) (string, error) {
+    authHeader := r.Header.Get("Authorization")
+    if authHeader == "" {
+        return "", errors.New("missing authorization header")
+    }
+
+    parts := strings.Split(authHeader, " ")
+    if len(parts) != 2 || parts[0] != "Bearer" {
+        return "", errors.New("invalid authorization header format")
+    }
+
+    return parts[1], nil
+}
+
+// parseToken validates the JWT token's signature and claims
+func parseToken(tokenStr string) (*jwt.Token, error) {
+    claims := &Claims{}
+    token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
+        // Validate signing method
+        if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+            return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+        }
+        return jwtKey, nil
+    })
+
+    if err != nil {
+        return nil, errors.New("invalid token")
+    }
+
+    if !token.Valid {
+        return nil, errors.New("token is invalid")
+    }
+
+    // Check token expiration
+    if time.Now().Unix() > claims.ExpiresAt {
+        return nil, errors.New("token has expired")
+    }
+
+    return token, nil
 }
