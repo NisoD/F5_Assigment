@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -99,14 +98,12 @@ func main() {
     publicChain = baseChain.ThenFunc(api_pkg.Login)
     router.Handle("/login", publicChain)
 
-
     // Protected routes
     protectedChain := baseChain.Append(api_pkg.Auth).ThenFunc(api_pkg.AccountsHandler)
     router.Handle("/accounts", protectedChain)
 
     protectedChain = baseChain.Append(api_pkg.Auth).ThenFunc(api_pkg.BalanceHandler)
     router.Handle("/balance", protectedChain)
-
 
     // Create server
     srv := &http.Server{
@@ -216,11 +213,23 @@ func recoveryMiddleware(next http.Handler) http.Handler {
     })
 }
 
+// Simplified log entry structure to match the requested format
+type SimplifiedLogEntry struct {
+    Req struct {
+        URL        string `json:"url"`
+        QSParams   string `json:"qs_params"`
+        Headers    string `json:"headers"`
+        ReqBodyLen int64  `json:"req_body_len"`
+    } `json:"req"`
+    Rsp struct {
+        StatusClass  string `json:"status_class"`
+        RspBodyLen   int64  `json:"rsp_body_len"`
+    } `json:"rsp"`
+}
+
 // Access logging middleware
 func accessLogMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        start := time.Now()
-
         // Create custom response writer to capture status and size
         rw := &responseWriter{
             ResponseWriter: w,
@@ -230,23 +239,31 @@ func accessLogMiddleware(next http.Handler) http.Handler {
         // Process request
         next.ServeHTTP(rw, r)
 
-        // Prepare log entry
-        entry := LogEntry{
-            Timestamp: time.Now().Format(time.RFC3339),
-            Request: RequestLog{
-                Method:     r.Method,
-                URL:        r.URL.String(),
-                Headers:    sanitizeHeaders(r.Header),
-                QueryParams: sanitizeQueryParams(r.URL.Query()),
-                BodySize:   r.ContentLength,
-            },
-            Response: ResponseLog{
-                Status:      rw.status,
-                StatusClass: fmt.Sprintf("%dxx", rw.status/100),
-                Size:        int64(rw.size),
-            },
-            Duration: time.Since(start).Milliseconds(),
+        // Prepare simplified log entry
+        entry := SimplifiedLogEntry{}
+        
+        // Populate request information
+        entry.Req.URL = r.URL.String()
+        
+        // Convert query params to string
+        entry.Req.QSParams = r.URL.RawQuery
+        if entry.Req.QSParams == "" {
+            entry.Req.QSParams = "{}"
         }
+        
+        // Convert headers to string
+        headerStrings := []string{}
+        for key, values := range sanitizeHeaders(r.Header) {
+            headerStrings = append(headerStrings, fmt.Sprintf("%s: %s", key, values[0]))
+        }
+        entry.Req.Headers = strings.Join(headerStrings, "; ")
+        
+        // Request body length
+        entry.Req.ReqBodyLen = r.ContentLength
+        
+        // Populate response information
+        entry.Rsp.StatusClass = fmt.Sprintf("%dxx", rw.status/100)
+        entry.Rsp.RspBodyLen = int64(rw.size)
 
         // Log entry
         if err := logEntry(entry); err != nil {
@@ -255,29 +272,8 @@ func accessLogMiddleware(next http.Handler) http.Handler {
     })
 }
 
-// Logging types and functions
-type LogEntry struct {
-    Timestamp string      `json:"timestamp"`
-    Request   RequestLog  `json:"req"`
-    Response  ResponseLog `json:"rsp"`
-    Duration  int64      `json:"duration_ms"`
-}
-
-type RequestLog struct {
-    Method      string      `json:"method"`
-    URL         string      `json:"url"`
-    Headers     http.Header `json:"headers"`
-    QueryParams url.Values  `json:"qs_params"`
-    BodySize    int64      `json:"req_body_len"`
-}
-
-type ResponseLog struct {
-    Status      int    `json:"status"`
-    StatusClass string `json:"status_class"`
-    Size        int64  `json:"rsp_body_len"`
-}
-
-func logEntry(entry LogEntry) error {
+// Log entry function
+func logEntry(entry SimplifiedLogEntry) error {
     data, err := json.Marshal(entry)
     if err != nil {
         return err
@@ -293,19 +289,6 @@ func sanitizeHeaders(headers http.Header) http.Header {
     for key, values := range headers {
         // Skip sensitive headers
         if isSensitiveHeader(key) {
-            sanitized[key] = []string{"[REDACTED]"}
-            continue
-        }
-        sanitized[key] = values
-    }
-    return sanitized
-}
-
-func sanitizeQueryParams(params url.Values) url.Values {
-    sanitized := make(url.Values)
-    for key, values := range params {
-        // Skip sensitive parameter names
-        if isSensitiveParam(key) {
             sanitized[key] = []string{"[REDACTED]"}
             continue
         }
