@@ -59,7 +59,7 @@ func setupLogging() error {
 
     // Open log file with timestamp in name
     timestamp := time.Now().Format("2006-01-02")
-    logPath := filepath.Join("logs", fmt.Sprintf("access-%s.log", timestamp))
+    logPath := filepath.Join("logs", fmt.Sprintf("access-%s.json", timestamp))
     
     logFile, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, logFilePermissions)
     if err != nil {
